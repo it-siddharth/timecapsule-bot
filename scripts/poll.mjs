@@ -35,7 +35,8 @@ const maxId = Math.max(...updates.map((u) => u.update_id));
 const mine = updates
   .filter((u) => u.message && String(u.message.chat.id) === String(CHAT))
   .map((u) => ({ id: u.update_id, m: u.message }))
-  .filter((x) => x.m.text || x.m.caption || x.m.photo);
+  .filter((x) => x.m.text || x.m.caption || x.m.photo)
+  .filter((x) => !(x.m.text && x.m.text.startsWith("/")));
 
 // Photo albums arrive as separate messages sharing a media_group_id; merge
 // each album into a single feed entry.
