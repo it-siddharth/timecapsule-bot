@@ -1,0 +1,70 @@
+name: Poll Telegram
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: telegram-poll
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Poll and publish
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DEPLOY_KEY: ${{ secrets.TIMECAPSULE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          eval "$(ssh-agent -s)" > /dev/null
+          echo "$DEPLOY_KEY" | tr -d '\r' | ssh-add - 2> /dev/null
+          mkdir -p ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2> /dev/null
+
+          git clone --depth 1 git@github.com:it-siddharth/Timecapsule.git capsule
+          node scripts/poll.mjs | tee poll.log
+          MAX=$(grep -o '^MAX_UPDATE_ID=[0-9]*' poll.log | cut -d= -f2)
+
+          cd capsule
+          git config user.name "timecapsule-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Feed: entries from Telegram"
+            git push origin main
+            curl -s "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+              --data-urlencode "chat_id=$CHAT_ID" \
+              --data-urlencode "text=Posted → https://it-siddharth.github.io/feed (live in ~2 min)" > /dev/null
+          fi
+          cd ..
+
+          # Ack processed updates only after a successful push, so a failed
+          # run leaves messages queued for the next poll.
+          if [ "$MAX" != "0" ]; then
+            curl -s "https://api.telegram.org/bot$BOT_TOKEN/getUpdates?offset=$((MAX + 1))&timeout=0" > /dev/null
+          fi
+
+      - name: Keep repo active
+        # GitHub disables cron workflows in repos with no activity for 60 days.
+        run: |
+          if [ -z "$(git log --since='45 days ago' -1 --format=%H)" ]; then
+            git config user.name "timecapsule-bot"
+            git config user.email "actions@users.noreply.github.com"
+            date > .keepalive
+            git add .keepalive
+            git commit -m "Keepalive"
+            git push
+          fi
