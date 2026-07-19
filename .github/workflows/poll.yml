@@ -2,7 +2,9 @@ name: Poll Telegram
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    # GitHub may delay or drop individual scheduled events. Each invocation
+    # long-polls for 5.5 hours and dispatches its successor; cron is recovery.
+    - cron: "23 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -10,11 +12,13 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: write
   contents: write
 
 jobs:
   poll:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -35,27 +39,69 @@ jobs:
           ssh-keyscan github.com >> ~/.ssh/known_hosts 2> /dev/null
 
           git clone --depth 1 git@github.com:it-siddharth/Timecapsule.git capsule
-          node scripts/poll.mjs | tee poll.log
-          MAX=$(grep -o '^MAX_UPDATE_ID=[0-9]*' poll.log | cut -d= -f2)
+          git -C capsule config user.name "timecapsule-bot"
+          git -C capsule config user.email "actions@users.noreply.github.com"
 
-          cd capsule
-          git config user.name "timecapsule-bot"
-          git config user.email "actions@users.noreply.github.com"
-          git add -A
-          if ! git diff --cached --quiet; then
-            git commit -m "Feed: entries from Telegram"
-            git push origin main
-            curl -s "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
-              --data-urlencode "chat_id=$CHAT_ID" \
-              --data-urlencode "text=Posted → https://it-siddharth.github.io/feed (live in ~2 min)" > /dev/null
-          fi
-          cd ..
+          deadline=$((SECONDS + 19800))
+          offset=""
+          failures=0
 
-          # Ack processed updates only after a successful push, so a failed
-          # run leaves messages queued for the next poll.
-          if [ "$MAX" != "0" ]; then
-            curl -s "https://api.telegram.org/bot$BOT_TOKEN/getUpdates?offset=$((MAX + 1))&timeout=0" > /dev/null
-          fi
+          while (( SECONDS < deadline )); do
+            # Pull before each batch because the site deployment workflow may
+            # commit feed enrichment while this worker is alive.
+            git -C capsule pull --rebase
+
+            if TELEGRAM_OFFSET="$offset" node scripts/poll.mjs > poll.log 2>&1; then
+              failures=0
+            else
+              cat poll.log
+              failures=$((failures + 1))
+              if (( failures >= 5 )); then
+                echo "Telegram polling failed five times consecutively" >&2
+                exit 1
+              fi
+              sleep 15
+              continue
+            fi
+
+            cat poll.log
+            max=$(grep -o '^MAX_UPDATE_ID=[0-9]*' poll.log | tail -1 | cut -d= -f2)
+            if [ -z "$max" ]; then
+              echo "Processor did not report MAX_UPDATE_ID" >&2
+              exit 1
+            fi
+            if [ "$max" = "0" ]; then
+              continue
+            fi
+
+            git -C capsule add content/feed public/feed
+            published=false
+            if ! git -C capsule diff --cached --quiet; then
+              git -C capsule commit -m "Feed: entries from Telegram"
+              if ! git -C capsule push origin main; then
+                git -C capsule pull --rebase
+                git -C capsule push origin main
+              fi
+              published=true
+            fi
+
+            # Passing this offset into the next successful getUpdates request
+            # acknowledges the batch only after its commit has been pushed.
+            offset=$((max + 1))
+
+            if [ "$published" = true ]; then
+              curl -fsS "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+                --data-urlencode "chat_id=$CHAT_ID" \
+                --data-urlencode "text=Posted → https://it-siddharth.github.io/feed (deploying now)" \
+                > /dev/null || true
+            fi
+          done
+
+      - name: Queue successor
+        if: ${{ always() && !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run poll.yml --ref main
 
       - name: Keep repo active
         # GitHub disables cron workflows in repos with no activity for 60 days.
